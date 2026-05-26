@@ -222,34 +222,65 @@ def save_cache(results):
     except:
         pass
 
+# ── 比较新旧数据 ──
+def compare_results(old, new):
+    if not old: return []
+    old_map = {r["code"]: r for r in old}
+    changes = []
+    for r in new:
+        o = old_map.get(r["code"])
+        if not o:
+            changes.append(f"[{r['code']}] {r['name']}：新增")
+        else:
+            parts = []
+            if o["status"] != r["status"]:
+                parts.append(f"状态 {o['status']} → {r['status']}")
+            if o["amount"] != r["amount"]:
+                parts.append(f"金额 {o['amount']} → {r['amount']}")
+            if parts:
+                changes.append(f"[{r['code']}] {r['name']}：{'，'.join(parts)}")
+    for r in old:
+        if r["code"] not in {x["code"] for x in new}:
+            changes.append(f"[{r['code']}] {r['name']}：已移除")
+    return changes
+
 # ── 主界面 ──
 st.title("📋 QDII LOF 限购查询")
 
-# 先显示缓存
+# 加载缓存
 cached = load_cache()
-if cached:
-    results = cached
-    cache_time = "缓存"
-else:
-    results = None
-    cache_time = ""
+if "results" not in st.session_state:
+    st.session_state.results = cached
 
-# 后台查询
-if st.button("🔄 刷新数据", use_container_width=True):
-    st.cache_data.clear()
+do_refresh = st.button("🔄 刷新数据", use_container_width=True)
+
+if do_refresh or st.session_state.results is None:
+    # 有缓存时先显示缓存，后台刷新
+    if cached and not do_refresh:
+        st.session_state.results = cached
+        st.info("正在后台查询最新数据...")
+
     with st.spinner(f"正在查询 {len(DEFAULT_FUNDS)} 只基金..."):
-        results = query_all(tuple(DEFAULT_FUNDS))
-        save_cache(results)
-        cache_time = ""
-    st.rerun()
+        st.cache_data.clear()
+        fresh = query_all(tuple(DEFAULT_FUNDS))
+        save_cache(fresh)
 
-# 如果没有数据，显示加载中
-if results is None:
-    with st.spinner("首次加载，正在查询..."):
-        results = query_all(tuple(DEFAULT_FUNDS))
-        save_cache(results)
-        cache_time = ""
-    st.rerun()
+    # 比较变化
+    old = st.session_state.results
+    if old:
+        changes = compare_results(old, fresh)
+        if changes:
+            st.warning(f"⚠️ 数据有变化（{len(changes)} 项）：")
+            for c in changes:
+                st.caption(f"  • {c}")
+        elif do_refresh:
+            st.success("数据无变化，已是最新")
+
+    st.session_state.results = fresh
+    if do_refresh:
+        st.rerun()
+
+results = st.session_state.results
 
 # ── 筛选 ──
 status_filter = st.radio("筛选", ["全部", "暂停申购", "限制大额申购", "开放申购"], horizontal=True, key="filter")
@@ -292,8 +323,6 @@ for r in filtered:
 st.markdown("---")
 now_bj = datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=8)))
 st.caption(f"数据来源: 天天基金 ｜ 更新: {now_bj.strftime('%H:%M:%S')} (北京)")
-if cache_time:
-    st.caption(f"({cache_time}数据，点击刷新获取最新)")
 
 st.components.v1.html("""
 <script>
