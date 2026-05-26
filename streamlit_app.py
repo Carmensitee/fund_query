@@ -54,7 +54,7 @@ if not st.session_state.auth:
             st.error("密码错误")
     st.stop()
 
-# ── 查询逻辑 ──
+# ── 查询逻辑（和桌面版 fund_server.py 完全一致）──
 def fetch(url, timeout=15):
     try:
         r = requests.get(url, headers=HEADERS, timeout=timeout)
@@ -63,48 +63,134 @@ def fetch(url, timeout=15):
     except:
         return None
 
+def strip_html(text):
+    text = re.sub(r"<[^>]+>", " ", text)
+    text = re.sub(r"&nbsp;", " ", text)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
+
+def normalize_status(raw):
+    raw = raw.strip()
+    if "暂停" in raw: return "暂停申购"
+    if "限制" in raw or "限大额" in raw or "限额" in raw: return "限制大额申购"
+    if "开放" in raw: return "开放申购"
+    return raw if raw else "未知"
+
+def _extract_cell_text(html, start_pos):
+    depth = 1
+    pos = start_pos
+    while pos < len(html) and depth > 0:
+        span_open = html.find("<span", pos)
+        span_close = html.find("</span>", pos)
+        if span_close >= 0 and (span_open < 0 or span_close < span_open):
+            depth -= 1
+            if depth == 0:
+                raw = html[start_pos:span_close]
+                return (strip_html(raw), span_close + 7)
+            pos = span_close + 7
+        elif span_open >= 0:
+            depth += 1
+            tag_close = html.find(">", span_open)
+            pos = (tag_close + 1) if tag_close >= 0 else (span_open + 5)
+        else:
+            break
+    return ("", start_pos)
+
 def get_fund_name(code):
     resp = fetch(f"http://fund.eastmoney.com/pingzhongdata/{code}.js")
     if resp:
         m = re.search(r'fS_name\s*=\s*"([^"]+)"', resp.text)
-        if m:
-            return m.group(1)
+        if m: return m.group(1)
     return f"基金{code}"
+
+def get_subscription_status(code):
+    resp = fetch(f"https://fund.eastmoney.com/{code}.html")
+    if not resp:
+        return "查询失败", ""
+    text = resp.text
+
+    item_match = re.search(
+        r'<span[^>]*class\s*=\s*"itemTit"[^>]*>[^<]*状态[：:][^<]*</span>',
+        text, re.IGNORECASE,
+    )
+    if not item_match:
+        if "暂停申购" in text: return "暂停申购", ""
+        if "限大额" in text: return "限制大额申购", ""
+        if "开放申购" in text: return "开放申购", ""
+        return "未知", ""
+
+    after_item = text[item_match.end():]
+    cell1_m = re.search(
+        r'<span[^>]*class\s*=\s*"staticCell"[^>]*>', after_item, re.IGNORECASE,
+    )
+    if not cell1_m:
+        return "未知", ""
+    sg_raw, cell1_end = _extract_cell_text(after_item, cell1_m.end())
+
+    after_cell1 = after_item[cell1_end:]
+    cell2_m = re.search(
+        r'<span[^>]*class\s*=\s*"staticCell"[^>]*>\s*([^<]*)',
+        after_cell1, re.IGNORECASE,
+    )
+    sh_raw = cell2_m.group(1).strip() if cell2_m else ""
+    return normalize_status(sg_raw), sh_raw
+
+def extract_limit_amount(code):
+    resp = fetch(f"https://fund.eastmoney.com/{code}.html")
+    if not resp: return None
+    text = resp.text
+
+    item_match = re.search(
+        r'<span[^>]*class\s*=\s*"itemTit"[^>]*>[^<]*状态[：:][^<]*</span>',
+        text, re.IGNORECASE,
+    )
+    if item_match:
+        after_item = text[item_match.end():]
+        cell_m = re.search(
+            r'<span[^>]*class\s*=\s*"staticCell"[^>]*>', after_item, re.IGNORECASE,
+        )
+        if cell_m:
+            sg_raw, _ = _extract_cell_text(after_item, cell_m.end())
+            m = re.search(r"(\d[\d,.]*)\s*[元万]", sg_raw)
+            if m:
+                amount = m.group(1).replace(",", "")
+                try: amount = str(int(round(float(amount))))
+                except: pass
+                unit = "万" if "万" in sg_raw[m.end()-10:m.end()+10] else "元"
+                return f"{amount}{unit}"
+
+    patterns = [
+        r"单日(?:累计)?(?:申购|购买)上限[：:]\s*(\d[\d,.]*)\s*[元万]",
+        r"(?:申购|购买)(?:金额)?上限[：:]\s*(\d[\d,.]*)\s*[元万]",
+    ]
+    for pat in patterns:
+        m = re.search(pat, text)
+        if m:
+            amount = m.group(1).replace(",", "")
+            try: amount = str(int(round(float(amount))))
+            except: pass
+            unit = "万" if "万" in m.group(0) else "元"
+            return f"{amount}{unit}"
+    return None
 
 def query_single(code):
     try:
         name = get_fund_name(code)
-        resp = fetch(f"https://fund.eastmoney.com/{code}.html")
-        if not resp:
-            return {"code": code, "name": name, "status": "查询失败", "amount": "—"}
+        sg_status, sh_status = get_subscription_status(code)
+        is_suspended = sg_status == "暂停申购"
+        is_limited = sg_status == "限制大额申购"
 
-        html = resp.text
-
-        # 申购状态
-        if "暂停申购" in html:
-            status = "暂停申购"
-        elif "限大额" in html or "限制大额" in html:
-            status = "限制大额申购"
-        elif "开放申购" in html:
-            status = "开放申购"
+        if is_suspended:
+            limit_amount = "—"
+        elif is_limited:
+            limit_amount = extract_limit_amount(code) or "需查看公告"
         else:
-            status = "未知"
+            limit_amount = "不限购"
 
-        # 限购金额
-        if status == "暂停申购":
-            amount = "—"
-        elif status == "限制大额申购":
-            m = re.search(r"(\d[\d,.]*)\s*[元万]", html)
-            if m:
-                n = m.group(1).replace(",", "")
-                unit = "万" if "万" in html[m.end()-10:m.end()+10] else "元"
-                amount = f"{n}{unit}"
-            else:
-                amount = "需查看公告"
-        else:
-            amount = "不限购"
+        if sh_status and "暂停" in sh_status:
+            sg_status += " / 暂停赎回"
 
-        return {"code": code, "name": name, "status": status, "amount": amount}
+        return {"code": code, "name": name, "status": sg_status, "amount": limit_amount}
     except:
         return {"code": code, "name": f"基金{code}", "status": "查询失败", "amount": "—"}
 
