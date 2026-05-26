@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+fund_cache.json
+fund_custom.json
+*.log
